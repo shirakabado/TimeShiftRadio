@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- アダプティブアイコンの背景レイヤー。前景（写真）の地色と同じクリーム色にして、
+     ランチャーのパララックス時にも継ぎ目が出ないようにする。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#FCEBDB" />
+</shape>
