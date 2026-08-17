@@ -1,21 +1,28 @@
 package net.enjoytech.timeshiftradio
 
 import android.app.Activity
+import android.app.DownloadManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -59,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import java.net.URLDecoder
 import net.enjoytech.timeshiftradio.ui.theme.Accent
 import net.enjoytech.timeshiftradio.ui.theme.TimeShiftRadioTheme
 
@@ -301,6 +309,13 @@ fun MainScreen(
                                 }
                             }
 
+                            // WebView 単体はダウンロード機能を持たない。これを付けないと、
+                            // ライブラリ画面の「保存」（Content-Disposition: attachment）は
+                            // 数十KB読んだところで接続を切って何も残らない。
+                            setDownloadListener { downloadUrl, userAgent, disposition, mimeType, _ ->
+                                startDownload(ctx, downloadUrl, userAgent, disposition, mimeType)
+                            }
+
                             webChromeClient = object : WebChromeClient() {
                                 override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
                                     Log.d(TAG, "${msg?.messageLevel()}: ${msg?.message()}")
@@ -389,6 +404,75 @@ private fun FooterButton(
         Text(label)
     }
 }
+
+/**
+ * 録音ファイルを Android の DownloadManager に渡して保存する。
+ *
+ * 保存先は端末の「Music」（API 29 以降は権限不要で公開領域に書ける）。
+ * API 28 以下は WRITE_EXTERNAL_STORAGE が必要になるため、権限の要らない
+ * アプリ専用領域に落とす（この端末では通らない経路だが、minSdk 26 なので残す）。
+ */
+private fun startDownload(
+    context: Context,
+    url: String,
+    userAgent: String?,
+    contentDisposition: String?,
+    mimeType: String?
+) {
+    val fileName = resolveFileName(url, contentDisposition, mimeType)
+    val request = DownloadManager.Request(Uri.parse(url)).apply {
+        setMimeType(mimeType)
+        setTitle(fileName)
+        setDescription(APP_TITLE)
+        userAgent?.let { addRequestHeader("User-Agent", it) }
+        CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, fileName)
+        } else {
+            setDestinationInExternalFilesDir(context, Environment.DIRECTORY_MUSIC, fileName)
+        }
+    }
+
+    val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+    val enqueued = manager?.let { runCatching { it.enqueue(request) } }
+    if (enqueued?.isSuccess == true) {
+        Toast.makeText(context, "「$fileName」を保存しています", Toast.LENGTH_SHORT).show()
+    } else {
+        val reason = enqueued?.exceptionOrNull()?.message ?: "DownloadManager が使えません"
+        Log.w(TAG, "download failed: $reason")
+        Toast.makeText(context, "保存に失敗しました: $reason", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * 保存するファイル名を決める。
+ *
+ * `URLUtil.guessFileName()` は `filename=` しか解釈せず、日本語ファイル名で使われる
+ * RFC 5987 の `filename*=utf-8''...` を読めない（URLが /api/recordings/15/download
+ * なので "download.bin" のような名前になってしまう）。まず `filename*=` を自分で
+ * ほどき、無ければ従来の推測に任せる。
+ */
+internal fun resolveFileName(url: String, contentDisposition: String?, mimeType: String?): String {
+    val extended = contentDisposition?.let { EXT_FILENAME.find(it) }
+    if (extended != null) {
+        val charset = extended.groupValues[1].ifBlank { "UTF-8" }
+        val encoded = extended.groupValues[2].trim('"')
+        val decoded = runCatching {
+            // URLDecoder は "+" を空白にしてしまうので、先に守ってから戻す
+            URLDecoder.decode(encoded.replace("+", "%2B"), charset)
+        }.getOrNull()
+        if (!decoded.isNullOrBlank()) return sanitizeFileName(decoded)
+    }
+    return sanitizeFileName(URLUtil.guessFileName(url, contentDisposition, mimeType))
+}
+
+/** パス区切り等をファイル名に使えない文字を落とす（サーバー側でも除去済みだが二重に守る） */
+internal fun sanitizeFileName(name: String): String =
+    name.replace(Regex("""[\\/:*?"<>|\x00-\x1f]"""), "_").trim().ifBlank { "recording.m4a" }
+
+/** Content-Disposition の filename*=charset''pct-encoded を取り出す */
+internal val EXT_FILENAME = Regex("""filename\*\s*=\s*([^']*)'[^']*'([^;]+)""", RegexOption.IGNORE_CASE)
 
 private fun errorHtml(code: Int, description: String, failingUrl: String?): String = """
     <html>
