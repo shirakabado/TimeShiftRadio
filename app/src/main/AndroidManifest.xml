@@ -21,6 +21,15 @@
             android:name="net.enjoytech.memscope.github"
             android:value="shirakabado/TimeShiftRadio" />
 
+        <!-- 保存した録音を MediaStore に登録する（音楽アプリの一覧に出すため） -->
+        <receiver
+            android:name=".DownloadCompleteReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.DOWNLOAD_COMPLETE" />
+            </intent-filter>
+        </receiver>
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
