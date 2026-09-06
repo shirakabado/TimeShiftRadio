@@ -34,7 +34,8 @@ android {
         applicationId = "net.enjoytech.timeshiftradio"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        // ビルドのたびに増える版番号（エポックからの分）。固定値だと更新を判定できない
+        versionCode = (System.currentTimeMillis() / 60000).toInt()
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
