@@ -9,6 +9,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -16,14 +17,15 @@ import android.util.Log
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -34,6 +36,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
@@ -49,9 +52,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,34 +65,61 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import androidx.fragment.app.FragmentActivity
 import java.net.URLDecoder
+import net.enjoytech.langateway.GatewayResult
+import net.enjoytech.langateway.LanGateway
+import net.enjoytech.langateway.compose.GatewayLockedContent
+import net.enjoytech.langateway.compose.GatewaySetupForm
 import net.enjoytech.timeshiftradio.ui.theme.Accent
+import net.enjoytech.timeshiftradio.ui.theme.BodyDark
+import net.enjoytech.timeshiftradio.ui.theme.BodyOnDark
 import net.enjoytech.timeshiftradio.ui.theme.TimeShiftRadioTheme
 
 private const val TAG = "TimeShiftRadio"
 private const val APP_TITLE = "TimeShiftRadio"
 
-/**
- * 接続先URL。リポジトリに含めないよう、`local.properties` の `timeshift.url`
- * （または環境変数 `TIMESHIFT_URL`）からビルド時に埋め込む。設定方法は README を参照。
- */
-private val TARGET_URL = BuildConfig.TARGET_URL
+/** LAN 認証ゲートウェイの台帳（lan_gateway の services.yaml）のサービス名 */
+private const val GATEWAY_SERVICE = "time_shift_radio"
 
 private const val PREFS_NAME = "webview_prefs"
 private const val KEY_LAST_URL = "last_url"
 private const val KEY_WEBVIEW_STATE = "webview_state"
 
-class MainActivity : ComponentActivity() {
+/** LOCKED: 指紋待ち・エラー / SETUP: 端末の登録 / READY: 表示中 */
+enum class Stage { LOCKED, SETUP, READY }
+
+/**
+ * 自宅サーバのタイムシフトラジオ（~/time_shift_radio の Next.js PWA + /api）を、LAN 認証ゲートウェイ
+ * （所在は登録画面で入れる。サービス名 time_shift_radio）を通して WebView で開く。
+ * 録音の再生（<audio> の /api/recordings/<id>/stream）は WebView の Cookie で、
+ * 保存（/api/recordings/<id>/download）は DownloadManager に Cookie を渡してゲートウェイを通る。
+ */
+class MainActivity : FragmentActivity() {
 
     /** フッター操作・状態保存・ネットワーク復旧リロードのためのWebView参照 */
     private var webViewRef: WebView? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Activity 再生成時に WebView の状態（履歴・現在 URL）を戻すための Bundle */
+    private var savedWebViewState: Bundle? = null
+
+    val stage = mutableStateOf(Stage.LOCKED)
+    val message = mutableStateOf("")
+    val busy = mutableStateOf(false)
+
+    /** LAN 認証ゲートウェイ */
+    val gateway by lazy { LanGateway(this, service = GATEWAY_SERVICE) }
+
+    /** セッションが開いたあとに WebView で開く URL（WebView がまだ無いときに預かる） */
+    private var pendingUrl: String? = null
 
     /**
      * registerNetworkCallback は登録直後に現在のネットワークで onAvailable を1回発火する。
@@ -112,18 +144,50 @@ class MainActivity : ComponentActivity() {
             WebView.setWebContentsDebuggingEnabled(true)
         }
 
-        val restoredState = savedInstanceState?.getBundle(KEY_WEBVIEW_STATE)
+        savedWebViewState = savedInstanceState?.getBundle(KEY_WEBVIEW_STATE)
         registerNetworkCallback()
 
         setContent {
-            TimeShiftRadioTheme {
-                MainScreen(
-                    title = APP_TITLE,
-                    url = TARGET_URL,
-                    savedBundle = restoredState,
-                    onWebViewCreated = { webViewRef = it }
-                )
+            when (stage.value) {
+                Stage.READY -> TimeShiftRadioTheme {
+                    MainScreen(title = APP_TITLE, activity = this)
+                }
+                Stage.SETUP -> GatewayFrame(APP_TITLE) {
+                    GatewaySetupForm(
+                        initialUrl = gateway.setupUrl,
+                        message = message.value,
+                        busy = busy.value,
+                        onSubmit = { url, code -> enroll(url, code) }
+                    )
+                }
+                Stage.LOCKED -> GatewayFrame(APP_TITLE) {
+                    GatewayLockedContent(
+                        message = message.value,
+                        busy = busy.value,
+                        onRetry = { unlock() },
+                        onSetup = { toSetup("") }
+                    )
+                }
             }
+        }
+
+        when {
+            // 回転・プロセス復帰で、セッションがまだ使えるなら指紋を求め直さない
+            savedWebViewState != null && gateway.isEnrolled && gateway.isSessionValid() -> {
+                pendingUrl = gateway.startUrl
+                stage.value = Stage.READY
+            }
+            gateway.isEnrolled -> unlock()
+            else -> stage.value = Stage.SETUP
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // セッションが切れていたら、画面を出す前に指紋で取り直す
+        if (stage.value == Stage.READY && !gateway.isSessionValid()) {
+            lock("セッションの期限が切れました")
+            unlock()
         }
     }
 
@@ -139,6 +203,7 @@ class MainActivity : ComponentActivity() {
      * VPN再接続等でネットワークが復旧したときに自動リロードする。
      * VPN経由だとインターフェースが同一（tun0）のままなので、
      * Chromiumのソケットプールが死んだ接続を掴み続ける。キャッシュごと捨てて張り直す。
+     * 開き直すのはゲートウェイの URL だけ（それ以外ならゲートウェイの最初の画面）。
      */
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -153,8 +218,12 @@ class MainActivity : ComponentActivity() {
                 }
                 Log.d(TAG, "network available -> reload")
                 runOnUiThread {
-                    webViewRef?.clearCache(true)
-                    webViewRef?.reload()
+                    val wv = webViewRef ?: return@runOnUiThread
+                    if (stage.value != Stage.READY) return@runOnUiThread
+                    wv.clearCache(true)
+                    val current = wv.url
+                    if (current != null && isGatewayUrl(current)) wv.reload()
+                    else homeUrl?.let { wv.loadUrl(it) }
                 }
             }
 
@@ -175,16 +244,192 @@ class MainActivity : ComponentActivity() {
         networkCallback = null
         webViewRef = null
     }
+
+    // ── 端末の登録とセッション（lan-gateway-android） ───────
+
+    private fun lock(msg: String) {
+        message.value = msg
+        stage.value = Stage.LOCKED
+        // READY を離れると画面ごと WebView が捨てられる。戻ったときは新しい WebView に開かせる
+        webViewRef = null
+    }
+
+    private fun toSetup(msg: String) {
+        webViewRef = null
+        gateway.reset()
+        message.value = msg
+        stage.value = Stage.SETUP
+    }
+
+    /** 登録画面から。登録コードで端末を登録し、端末トークンを指紋で暗号化して保存する */
+    private fun enroll(input: String, code: String) {
+        busy.value = true
+        message.value = "登録しています…"
+        gateway.enroll(this, input, code) { handle(it) }
+    }
+
+    /** 起動時・期限切れ時。指紋で端末トークンを取り出し、セッションに交換する */
+    fun unlock() {
+        lock("指紋認証でログインしてください")
+        busy.value = true
+        gateway.unlock(this) { handle(it) }
+    }
+
+    private fun handle(result: GatewayResult) {
+        busy.value = false
+        when (result) {
+            is GatewayResult.Ready -> {
+                message.value = ""
+                // 前に開いていたゲートウェイの画面に戻る。ゲートウェイ以外（前の版の :9360）は使わない
+                val last = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_LAST_URL, null)
+                openWhenReady(last?.takeIf { isGatewayUrl(it) } ?: result.url)
+                stage.value = Stage.READY
+            }
+            is GatewayResult.Failed ->
+                if (result.error.needsEnrollment) toSetup(result.error.message)
+                else if (stage.value == Stage.SETUP) message.value = result.error.message
+                else lock(result.error.message)
+            GatewayResult.Cancelled -> finish()
+        }
+    }
+
+    /** ゲートウェイの所在の下の URL か（ホストだけでなくポートまで見る） */
+    fun isGatewayUrl(url: String): Boolean {
+        val base = gateway.baseUrl ?: return false
+        return url.startsWith("$base/")
+    }
+
+    private fun openWhenReady(url: String) {
+        val wv = webViewRef
+        if (wv == null) {
+            pendingUrl = url
+            return
+        }
+        val bundle = savedWebViewState
+        savedWebViewState = null
+        val restored = bundle != null && wv.restoreState(bundle) != null
+        if (!restored) {
+            // 再起動後の白画面（失敗レスポンスのディスクキャッシュ）を防ぐ
+            wv.clearCache(true)
+            wv.loadUrl(url)
+        }
+    }
+
+    /** MainScreen が WebView を作ったときに呼ぶ。預かっていた URL を開く */
+    fun onWebViewCreated(wv: WebView) {
+        webViewRef = wv
+        pendingUrl?.let {
+            pendingUrl = null
+            openWhenReady(it)
+        }
+    }
+
+    /** WebView にゲートウェイの 401（セッション切れ）が返ったとき */
+    fun onSessionExpired() {
+        if (stage.value != Stage.READY) return
+        lock("セッションの期限が切れました")
+        unlock()
+    }
+
+    /** 最初の画面（ゲートウェイの下）。セッションが開く前は null */
+    val homeUrl: String? get() = gateway.startUrl
+}
+
+/** 登録画面・ロック画面。表示中と同じヘッダーとフッター（終了だけ）、ボディはサーバの画面と同じダーク */
+@Composable
+fun GatewayFrame(title: String, content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Accent,
+            onPrimary = Color.White,
+            background = BodyDark,
+            onBackground = BodyOnDark,
+            surface = BodyDark,
+            onSurface = BodyOnDark
+        )
+    ) {
+        Scaffold(
+            containerColor = BodyDark,
+            // ライブラリの見出しは色を指定しない（周りの文字色を使う）ので、暗いボディに合わせて明るい色にする
+            contentColor = BodyOnDark,
+            contentWindowInsets = WindowInsets(0)
+        ) { _ ->
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+            ) {
+                Header(title)
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .background(BodyDark)
+                ) { content() }
+                Footer {
+                    FooterButton("終了", Modifier.weight(1f)) {
+                        (context as? Activity)?.finishAndRemoveTask()
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun Header(title: String) {
+    Surface(
+        color = Accent,
+        contentColor = Color.White,
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(64.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                title,
+                color = Color.White,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+private fun Footer(content: @Composable RowScope.() -> Unit) {
+    Surface(
+        color = Accent,
+        contentColor = Color.White,
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content
+        )
+    }
 }
 
 @Composable
 fun MainScreen(
     title: String,
-    url: String,
-    savedBundle: Bundle?,
-    onWebViewCreated: (WebView) -> Unit
+    activity: MainActivity
 ) {
     val context = LocalContext.current
+    val gateway = activity.gateway
     var webView by remember { mutableStateOf<WebView?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -194,7 +439,7 @@ fun MainScreen(
         webView?.takeIf { it.canGoBack() }?.goBack()
     }
 
-    Scaffold(contentWindowInsets = WindowInsets(0)) {
+    Scaffold(containerColor = BodyDark, contentColor = BodyOnDark, contentWindowInsets = WindowInsets(0)) {
         Column(
             Modifier
                 .fillMaxSize()
@@ -203,34 +448,14 @@ fun MainScreen(
                 .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
         ) {
             // ── Header ──────────────────────────────────────────
-            Surface(
-                color = Accent,
-                contentColor = Color.White,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-            ) {
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(64.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        title,
-                        color = Color.White,
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
+            Header(title)
 
             // ── Body (WebView) ──────────────────────────────────
             Box(
                 Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .background(Color.White)
+                    .background(BodyDark)
             ) {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
@@ -250,6 +475,10 @@ fun MainScreen(
                             settings.loadWithOverviewMode = true
                             // ラジオ再生をユーザー操作なしで開始できるようにする
                             settings.mediaPlaybackRequiresUserGesture = false
+                            // ゲートウェイの画面に平文の部品を混ぜさせない・ファイルを読ませない
+                            LanGateway.hardenWebSettings(settings)
+                            // 読み込み中に白く光らない（サーバの画面と同じダーク）
+                            setBackgroundColor(BodyDark.toArgb())
 
                             webViewClient = object : WebViewClient() {
                                 override fun shouldOverrideUrlLoading(
@@ -271,7 +500,8 @@ fun MainScreen(
                                     isLoading = false
                                     canGoBack = view?.canGoBack() == true
                                     // プロセスが完全に死んでBundleごと失われた場合のフォールバック
-                                    url?.let {
+                                    // （ゲートウェイの画面だけ残す。前の版の :9360 は残さない）
+                                    url?.takeIf { activity.isGatewayUrl(it) }?.let {
                                         ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                                             .edit().putString(KEY_LAST_URL, it).apply()
                                     }
@@ -294,7 +524,7 @@ fun MainScreen(
                                 ) {
                                     if (request?.isForMainFrame != true) return
                                     isLoading = false
-                                    val failingUrl = request.url?.toString() ?: url
+                                    val failingUrl = request.url?.toString() ?: activity.homeUrl
                                     val code = error?.errorCode ?: 0
                                     val desc = error?.description?.toString() ?: ""
                                     Log.w(TAG, "onReceivedError $code $desc $failingUrl")
@@ -307,13 +537,32 @@ fun MainScreen(
                                         null
                                     )
                                 }
+
+                                override fun onReceivedHttpError(
+                                    view: WebView?,
+                                    request: WebResourceRequest?,
+                                    errorResponse: WebResourceResponse?
+                                ) {
+                                    // ゲートウェイの 401 はセッション切れ。画面の中の API・音声でも指紋で取り直す
+                                    if (gateway.isSessionExpired(request, errorResponse)) activity.onSessionExpired()
+                                }
+
+                                override fun onReceivedSslError(
+                                    view: WebView?,
+                                    handler: SslErrorHandler?,
+                                    error: SslError?
+                                ) {
+                                    // ゲートウェイの証明書を確かめられないときは、続行させない（盗み見の恐れがある）
+                                    handler?.cancel()
+                                    Toast.makeText(ctx, "ゲートウェイの証明書を確かめられません", Toast.LENGTH_LONG).show()
+                                }
                             }
 
                             // WebView 単体はダウンロード機能を持たない。これを付けないと、
                             // ライブラリ画面の「保存」（Content-Disposition: attachment）は
                             // 数十KB読んだところで接続を切って何も残らない。
                             setDownloadListener { downloadUrl, userAgent, disposition, mimeType, _ ->
-                                startDownload(ctx, downloadUrl, userAgent, disposition, mimeType)
+                                startDownload(activity, downloadUrl, userAgent, disposition, mimeType)
                             }
 
                             webChromeClient = object : WebChromeClient() {
@@ -323,19 +572,10 @@ fun MainScreen(
                                 }
                             }
 
-                            onWebViewCreated(this)
                             webView = this
-
-                            if (savedBundle != null) {
-                                restoreState(savedBundle)
-                            } else {
-                                // 再起動後の白画面（失敗レスポンスのディスクキャッシュ）を防ぐ
-                                clearCache(true)
-                                val lastUrl = ctx
-                                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                                    .getString(KEY_LAST_URL, null)
-                                loadUrl(lastUrl ?: url)
-                            }
+                            // 開く URL は、セッションが開いたときに MainActivity が決める
+                            // （復元の優先順位: Bundle > 前に開いていたゲートウェイの URL > 最初の画面）
+                            activity.onWebViewCreated(this)
                         }
                     }
                 )
@@ -353,31 +593,18 @@ fun MainScreen(
             }
 
             // ── Footer ──────────────────────────────────────────
-            Surface(
-                color = Accent,
-                contentColor = Color.White,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-            ) {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(64.dp)
-                        .padding(horizontal = 12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    FooterButton("リロード", Modifier.weight(1f)) {
-                        webView?.clearCache(true)
-                        webView?.loadUrl(url)
-                    }
-                    FooterButton("戻る", Modifier.weight(1f)) {
-                        webView?.takeIf { it.canGoBack() }?.goBack()
-                    }
-                    FooterButton("終了", Modifier.weight(1f)) {
-                        (context as? Activity)?.finishAndRemoveTask()
-                    }
+            Footer {
+                FooterButton("リロード", Modifier.weight(1f)) {
+                    // リロードはゲートウェイの最初の画面だけ（前の版の :9360 は開かない）
+                    val home = activity.homeUrl ?: return@FooterButton
+                    webView?.clearCache(true)
+                    webView?.loadUrl(home)
+                }
+                FooterButton("戻る", Modifier.weight(1f)) {
+                    webView?.takeIf { it.canGoBack() }?.goBack()
+                }
+                FooterButton("終了", Modifier.weight(1f)) {
+                    (context as? Activity)?.finishAndRemoveTask()
                 }
             }
         }
@@ -413,18 +640,33 @@ private fun FooterButton(
  * アプリ専用領域に落とす（この端末では通らない経路だが、minSdk 26 なので残す）。
  */
 private fun startDownload(
-    context: Context,
+    activity: MainActivity,
     url: String,
     userAgent: String?,
     contentDisposition: String?,
     mimeType: String?
 ) {
+    val context: Context = activity
+    // ゲートウェイの外（前の版の :9360 など）からは落とさない。Cookie はゲートウェイのものだけ渡す
+    if (!activity.isGatewayUrl(url)) {
+        Log.w(TAG, "download refused (not gateway): $url")
+        Toast.makeText(context, "ゲートウェイの外のファイルは保存できません", Toast.LENGTH_LONG).show()
+        return
+    }
+    // DownloadManager は WebView の外で通信するので、セッションが切れていると 401 で失敗する。先に取り直す
+    if (!activity.gateway.isSessionValid()) {
+        Toast.makeText(context, "セッションの期限が切れました。ログインしてからもう一度保存してください", Toast.LENGTH_LONG).show()
+        activity.onSessionExpired()
+        return
+    }
     val fileName = resolveFileName(url, contentDisposition, mimeType)
     val request = DownloadManager.Request(Uri.parse(url)).apply {
         setMimeType(mimeType)
         setTitle(fileName)
         setDescription(APP_TITLE)
         userAgent?.let { addRequestHeader("User-Agent", it) }
+        // ゲートウェイのセッション（gw_session）を含む WebView の Cookie を付ける。無いとゲートウェイが 401 で断る。
+        // DownloadManager はアプリの networkSecurityConfig（自宅 CA）で TLS を確かめる（Android 7 以降）
         CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
         setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -477,12 +719,12 @@ internal val EXT_FILENAME = Regex("""filename\*\s*=\s*([^']*)'[^']*'([^;]+)""", 
 private fun errorHtml(code: Int, description: String, failingUrl: String?): String = """
     <html>
     <head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-    <body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;background:#f5f7fa;color:#1c1c1e;">
+    <body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;background:#0d1117;color:#c9d1d9;">
       <div style="text-align:center;padding:24px;">
         <h2 style="margin:0 0 12px;">ページを読み込めません</h2>
         <p style="margin:0 0 4px;">エラーコード: $code</p>
         <p style="margin:0 0 4px;">$description</p>
-        <p style="margin:0 0 20px;font-size:12px;color:#666;word-break:break-all;">${failingUrl ?: ""}</p>
+        <p style="margin:0 0 20px;font-size:12px;color:#8b949e;word-break:break-all;">${failingUrl ?: ""}</p>
         <button onclick="location.reload()"
                 style="background-color:#628DB6;color:#fff;border:none;border-radius:8px;height:40px;padding:0 24px;font-size:16px;">
           再試行

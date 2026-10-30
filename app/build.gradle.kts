@@ -1,26 +1,6 @@
-import java.util.Properties
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
-}
-
-// 接続先URLはリポジトリに含めない。
-// 優先順位: local.properties の timeshift.url > 環境変数 TIMESHIFT_URL > プレースホルダ
-val timeShiftUrl: String = run {
-    val props = Properties()
-    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { props.load(it) }
-    val url = props.getProperty("timeshift.url")
-        ?: System.getenv("TIMESHIFT_URL")
-    if (url.isNullOrBlank()) {
-        logger.warn(
-            "timeshift.url が未設定です。local.properties に " +
-                "timeshift.url=http://<サーバ>:<ポート> を追加してください。"
-        )
-        "http://localhost:9360"
-    } else {
-        url
-    }
 }
 
 android {
@@ -39,8 +19,6 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        buildConfigField("String", "TARGET_URL", "\"$timeShiftUrl\"")
     }
 
     buildTypes {
@@ -58,7 +36,6 @@ android {
     }
     buildFeatures {
         compose = true
-        buildConfig = true
     }
 }
 
@@ -71,6 +48,8 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    // LAN 認証ゲートウェイ（端末登録・指紋・セッション）
+    implementation("net.enjoytech.langateway:gateway-compose:1.4.0")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

@@ -13,7 +13,7 @@ import org.junit.Test
  */
 class DownloadFileNameTest {
 
-    private val url = "http://192.168.75.20:9360/api/recordings/15/download"
+    private val url = "https://gateway.example:9444/api/recordings/15/download"
 
     @Test
     fun `RFC 5987 の日本語ファイル名をほどく`() {

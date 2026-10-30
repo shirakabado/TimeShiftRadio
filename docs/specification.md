@@ -11,7 +11,7 @@ Web UI を、WebView で表示する Android クライアントです。
 - **対応 OS**: Android 8.0（API 26）以上
 - **ターゲット SDK**: 36 / **コンパイル SDK**: 37
 - **言語 / UI**: Kotlin + Jetpack Compose（Material3）
-- **接続先**: `http://<TimeShiftRadio サーバ>:<PORT>`（`BuildConfig.TARGET_URL`、→ 10.1）
+- **接続先**: LAN 認証ゲートウェイ `https://<ゲートウェイ>:<PORT>`（サービス名 `time_shift_radio`、→ 10.1）
 
 ---
 
@@ -57,14 +57,14 @@ Header / Footer は Accent カラー `#628DB6` に白文字で固定します。
 
 | 要素 | 内容 |
 |------|------|
-| WebView | `TARGET_URL` のページを表示。`layoutParams` は `MATCH_PARENT` を明示 |
+| WebView | ゲートウェイの `startUrl` のページを表示。`layoutParams` は `MATCH_PARENT` を明示 |
 | ローディング | 読み込み中のみ、黒 40% のオーバーレイと `CircularProgressIndicator`（白）を重ねる |
 
 ### 3.3 Footer
 
 | ボタン | 動作 |
 |--------|------|
-| `リロード` | `clearCache(true)` の後 `loadUrl(TARGET_URL)` |
+| `リロード` | `clearCache(true)` の後 `loadUrl(startUrl)`（ゲートウェイの最初の画面） |
 | `戻る` | `canGoBack()` が true のとき `goBack()`。履歴がなければ何もしない |
 | `終了` | `finishAndRemoveTask()` |
 
@@ -165,8 +165,9 @@ WebView（Chromium）はエラーレスポンスや空レスポンスをディ�
 | 2 | `SharedPreferences` への最終 URL 保存 | プロセス完全終了（Bundle ごと失われるケース） |
 | 3 | `android:configChanges` | 画面回転等の Configuration 変更（そもそも再生成させない） |
 
-- 保存先: `webview_prefs` / キー `last_url`、`onPageFinished` で毎回更新
-- 復元順序: `savedInstanceState` があれば `restoreState`、なければ `last_url`、それも無ければ `TARGET_URL`
+- 保存先: `webview_prefs` / キー `last_url`、`onPageFinished` で毎回更新（ゲートウェイの URL だけ）
+- 復元順序: `savedInstanceState` があれば `restoreState`、なければ `last_url`（ゲートウェイの URL のときだけ）、それも無ければ `startUrl`。
+  開くのはゲートウェイのセッションが開いたあと
 - `configChanges`: `orientation|screenSize|screenLayout|keyboardHidden`
 
 ---
@@ -178,8 +179,9 @@ WebView（Chromium）はエラーレスポンスや空レスポンスをディ�
 | `INTERNET` | サーバへの HTTP 接続 |
 | `ACCESS_NETWORK_STATE` | `registerNetworkCallback` によるネットワーク復旧検知 |
 
-`android:usesCleartextTraffic="true"` を設定。接続先が LAN 内の平文 HTTP であり、
-Android 9 以降は既定でクリアテキスト通信がブロックされるため。
+平文の通信は許可しない。`android:networkSecurityConfig="@xml/lan_gateway_network_security_config"`
+（ライブラリが持つ。自宅 CA だけを信頼）で、ゲートウェイの HTTPS だけを通す。`android:allowBackup="false"`
+（端末トークン・セッションをバックアップに出さない）。SSL エラーは `handler.cancel()` で続行させない。
 
 ---
 
@@ -217,30 +219,23 @@ README はリポジトリルートに標準名 `README.md` で置き、冒頭を
 
 ## 10. ビルド構成
 
-### 10.1 接続先 URL（`BuildConfig.TARGET_URL`）
+### 10.1 接続先（LAN 認証ゲートウェイ）
 
-接続先は自宅サーバの内部アドレスであり、リポジトリが公開されているため
-**ソースには含めず**、ビルド時に `BuildConfig` へ埋め込む。
+アプリはサーバを直接開かず、LAN 認証ゲートウェイ（`~/lan_gateway`）を通す。ゲートウェイはセッションの
+Cookie でサービス（台帳の `time_shift_radio`）を決め、パスはそのまま渡す。
 
-| 優先順位 | 指定元 | 用途 |
-|---------|--------|------|
-| 1 | `local.properties` の `timeshift.url` | 通常の開発（Git 管理外） |
-| 2 | 環境変数 `TIMESHIFT_URL` | CI / 自動ビルド |
-| 3 | `http://localhost:9360` | 未設定時のプレースホルダ |
+| 段階 | 画面 | 内容 |
+|------|------|------|
+| SETUP | 登録画面（`GatewaySetupForm`） | ゲートウェイの所在と登録コードで端末を登録し、端末トークンを指紋で暗号化して保存 |
+| LOCKED | ロック画面（`GatewayLockedContent`） | 起動時・セッション切れのとき。指紋でセッションを開く |
+| READY | WebView | ゲートウェイの `startUrl`（または前に開いていたゲートウェイの URL）を開く |
 
-未設定時は Gradle が警告を出し、実行時は §5.3 のエラーページが表示される。
-
-```kotlin
-// app/build.gradle.kts
-buildConfigField("String", "TARGET_URL", "\"$timeShiftUrl\"")
-
-buildFeatures {
-    buildConfig = true   // BuildConfig 生成に必須
-}
-```
-
-`buildFeatures.buildConfig = true` を忘れると `BuildConfig` クラスが生成されず、
-`MainActivity.kt` の参照が未解決になる点に注意。
+- 回転・プロセス復帰でセッションがまだ使えるなら指紋を求め直さない。`onResume` で切れていれば取り直す
+- 画面の中の通信（`/api`・`<audio>` の `/api/recordings/<id>/stream`）は WebView の Cookie でゲートウェイを通る。
+  ゲートウェイの 401（`onReceivedHttpError`）はセッション切れとして指紋で取り直す
+- 保存（`/api/recordings/<id>/download`）は DownloadManager に `CookieManager` の Cookie（`gw_session` を含む）を渡す。
+  ゲートウェイの外の URL は保存しない。セッションが切れていれば先に取り直す
+- ライブラリは GitHub Packages（`shirakabado/lan-gateway-android`）。`~/.gradle/gradle.properties` の `gpr.user` / `gpr.key` で読む
 
 ### 10.2 その他
 

@@ -1,11 +1,13 @@
 # TimeShiftRadio
 
-自宅サーバ上のタイムシフトラジオ（番組表・予約・ライブラリ）を WebView で表示する Android クライアント。
+自宅サーバ上のタイムシフトラジオ（番組表・予約・ライブラリ）を、LAN 認証ゲートウェイ経由で WebView に表示する Android クライアント。
 VPN / LAN 経由での接続断からの復旧と、プロセス終了後の閲覧状態の復元に対応しています。
 
 ## 主要機能
 
-- 自宅サーバ `http://<TimeShiftRadio サーバ>:<PORT>` の WebView 表示（外部ブラウザには遷移しない）
+- LAN 認証ゲートウェイ（`https://<ゲートウェイ>:<PORT>`、サービス名 `time_shift_radio`）を通した WebView 表示（外部ブラウザには遷移しない）
+  - 初回は端末の登録（ゲートウェイの所在と登録コード）、以後は起動時に指紋でセッションを開く
+  - 録音の再生（`<audio>`）は WebView の Cookie で、保存（DownloadManager）はゲートウェイの Cookie を付けて通る
 - ネットワーク復旧時のキャッシュクリア＋自動リロード（VPN 再接続後の白画面対策）
 - メインフレームの接続エラー時に再試行ボタン付きエラーページを差し込み
 - プロセス終了・クラッシュ後も直前の画面へ復帰（先祖返り防止）
@@ -30,22 +32,16 @@ Header / Footer は Accent カラー `#628DB6`、Body はサーバ側ページ�
 - UI: Jetpack Compose (Material3) / Compose BOM `2026.02.01`
 - minSdk 26 / targetSdk 36 / compileSdk 37
 - Android Gradle Plugin 9.2.1 / Gradle 9.4.1
-- 主要ライブラリ: `androidx.activity.compose`, `androidx.core.ktx`, `androidx.lifecycle.runtime.ktx`
+- 主要ライブラリ: `androidx.activity.compose`, `androidx.core.ktx`, `androidx.lifecycle.runtime.ktx`,
+  `net.enjoytech.langateway:gateway-compose`（LAN 認証ゲートウェイ。GitHub Packages の shirakabado/lan-gateway-android）
 
 ## セットアップ
 
 1. Android Studio で本ディレクトリを開く
 2. `local.properties` に SDK パスを設定（初回自動生成）
-3. **接続先 URL を設定する。** `local.properties`（Git 管理外）に次の行を追加:
-
-   ```properties
-   timeshift.url=http://<TimeShiftRadio サーバ>:<PORT>
-   ```
-
-   環境変数 `TIMESHIFT_URL` でも指定可（CI 向け）。優先順位は
-   `local.properties` > 環境変数 > プレースホルダ `http://localhost:9360`。
-   未設定のままビルドすると Gradle が警告を出し、実行時は接続エラー画面になります。
-4. 端末から当該サーバに到達可能であること（同一 LAN もしくは VPN 接続）を確認
+3. **ゲートウェイのライブラリを読めるようにする。** `~/.gradle/gradle.properties` に `gpr.user` / `gpr.key`
+   （`read:packages` の個人用トークン）を置く。接続先 URL の設定は要らない（ゲートウェイの所在はアプリの登録画面で入れる）
+4. 端末からゲートウェイに到達可能であること（同一 LAN もしくは VPN 接続）を確認し、登録コードを発行してもらう
 5. ビルド＆実行
 
 ## ディレクトリ構成
