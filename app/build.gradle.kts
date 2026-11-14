@@ -49,7 +49,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     // LAN 認証ゲートウェイ（端末登録・指紋・セッション）
-    implementation("net.enjoytech.langateway:gateway-compose:1.4.0")
+    implementation("net.enjoytech.langateway:gateway-compose:1.5.1")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
